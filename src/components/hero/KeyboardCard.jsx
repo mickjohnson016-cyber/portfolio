@@ -182,59 +182,78 @@ function Keycap({
   const baseGeometry = useMemo(() => new THREE.BoxGeometry(KEY_SIZE, BASE_HEIGHT, KEY_SIZE), []);
   const capGeometry = useMemo(() => new THREE.BoxGeometry(TOP_SIZE, CAP_HEIGHT, TOP_SIZE), []);
 
+  // Safe Y movement bounds — keycap can never leave this range
+  const Y_MIN = -0.06;
+  const Y_MAX = 0.03;
+  // Maximum spring velocity — prevents runaway accumulation
+  const VEL_MAX = 2.0;
+
   useFrame((_, delta) => {
     if (!group.current) return;
 
-    const dt = Math.min(delta, 0.05);
+    // Clamp delta to prevent physics explosion on tab-switch or lag spikes
+    const dt = Math.min(delta, 0.033);
 
     // ── Spring-driven Y position ──
-    // Pressed: push down fast | Hover: lift up | Idle: rest
-    const targetY = pressed ? -0.04 : hovered ? 0.015 : 0;
+    // Pressed: push down (mechanical) | Hover: subtle lift | Idle: rest at 0
+    const targetY = pressed ? -0.04 : hovered ? 0.012 : 0;
 
-    // Press = stiff + high damping (fast snap down, no bounce)
-    // Release/hover = moderate stiffness + low damping (overshoot bounce)
-    const stiffness = pressed ? 1200 : 400;
-    const damping = pressed ? 50 : 14;
+    // Press = very stiff + heavily damped (fast snap, no bounce)
+    // Release/hover = moderate stiffness + higher damping (controlled settle)
+    const stiffness = pressed ? 1200 : 350;
+    const damping = pressed ? 55 : 22;
 
-    const force = (targetY - spring.current.pos) * stiffness;
-    spring.current.vel += (force - spring.current.vel * damping) * dt;
+    // Semi-implicit Euler integration with velocity damping applied first
+    const springForce = (targetY - spring.current.pos) * stiffness;
+    const dampingForce = spring.current.vel * damping;
+    spring.current.vel += (springForce - dampingForce) * dt;
+
+    // Clamp velocity to prevent runaway accumulation during rapid interactions
+    spring.current.vel = THREE.MathUtils.clamp(spring.current.vel, -VEL_MAX, VEL_MAX);
+
     spring.current.pos += spring.current.vel * dt;
+
+    // Hard clamp final position — keycap can never fly away
+    spring.current.pos = THREE.MathUtils.clamp(spring.current.pos, Y_MIN, Y_MAX);
 
     group.current.position.y = spring.current.pos;
 
-    // ── Scale: subtle compression on press ──
+    // ── Scale: subtle compression on press (frame-rate independent) ──
     const targetScale = pressed ? 0.97 : 1;
-    const scaleLerp = pressed ? 0.3 : 0.12;
-    const s = THREE.MathUtils.lerp(group.current.scale.x, targetScale, scaleLerp);
+    const scaleDamp = 1 - Math.pow(pressed ? 0.001 : 0.01, dt);
+    const s = THREE.MathUtils.lerp(group.current.scale.x, targetScale, scaleDamp);
     group.current.scale.set(s, s, s);
 
     // ── Base depth compression on press (key sinks into chassis) ──
     if (baseMesh.current) {
-      const targetBaseScaleY = pressed ? 0.45 : 1;
+      const targetBaseScaleY = pressed ? 0.5 : 1;
+      const baseDamp = 1 - Math.pow(pressed ? 0.001 : 0.005, dt);
       baseMesh.current.scale.y = THREE.MathUtils.lerp(
         baseMesh.current.scale.y,
         targetBaseScaleY,
-        pressed ? 0.3 : 0.15
+        baseDamp
       );
     }
 
-    // ── Top cap emissive brightness ──
+    // ── Top cap emissive brightness (frame-rate independent) ──
     if (topMaterial.current) {
       const targetEmissive = pressed ? 0.12 : hovered ? 0.2 : 0.05;
+      const emDamp = 1 - Math.pow(0.005, dt);
       topMaterial.current.emissiveIntensity = THREE.MathUtils.lerp(
         topMaterial.current.emissiveIntensity,
         targetEmissive,
-        0.15
+        emDamp
       );
     }
 
-    // ── Base ledge subtle glow on hover ──
+    // ── Base ledge subtle glow on hover (frame-rate independent) ──
     if (baseMaterial.current) {
       const targetBaseEmissive = hovered ? 0.06 : 0;
+      const baseEmDamp = 1 - Math.pow(0.008, dt);
       baseMaterial.current.emissiveIntensity = THREE.MathUtils.lerp(
         baseMaterial.current.emissiveIntensity,
         targetBaseEmissive,
-        0.12
+        baseEmDamp
       );
     }
   });
@@ -251,12 +270,16 @@ function Keycap({
   const handlePointerOut = useCallback(() => {
     setHovered(false);
     setPressed(false);
+    // Kill residual velocity so the key settles cleanly to neutral
+    spring.current.vel = 0;
     document.body.style.cursor = 'auto';
   }, []);
 
   const handlePointerDown = useCallback((e) => {
     e.stopPropagation();
     setPressed(true);
+    // Reset velocity before press to prevent additive stacking
+    spring.current.vel = 0;
     playKeyClick();
   }, []);
 
